@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints / training outputs
+checkpoints/
+outputs/
+runs/
+*.pth
+*.pt
+*.ckpt
+
+# Dataset (large, keep local)
+data/
+
+# Logs
+*.log
+logs/
+tensorboard_logs/
