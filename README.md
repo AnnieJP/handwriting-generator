@@ -1,6 +1,6 @@
 # Personalized Handwriting Generation from Printed and LaTeX Text
 
-CS 4391 – Computer Vision | University of Texas at Dallas
+CS 6384 – Computer Vision | University of Texas at Dallas
 
 ## Overview
 
