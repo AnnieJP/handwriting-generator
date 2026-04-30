@@ -331,6 +331,7 @@ class UNet(nn.Module):
         self.mid_attn = CrossAttention(in_ch, context_dim)
         self.mid_res2 = ResidualBlock(in_ch, in_ch, time_dim, cond_dim)
 
+        """
         for i, out_ch in enumerate(reversed(channels[:-1])):
             skip_ch = skip_ch_list[-(i + 1)]
             use_attn = (len(channels) - 2 - i) in use_attn_at
@@ -339,10 +340,30 @@ class UNet(nn.Module):
             )
             in_ch = out_ch
 
+        """
+        # changed by Nani - The last up block does not have a skip connection, so we use skip_ch=0 and concatenate a zero tensor
+        for i, out_ch in enumerate(reversed(channels)):
+            skip_ch = skip_ch_list[-(i + 1)]
+            use_attn = (len(channels) - 1 - i) in use_attn_at
+            self.up_blocks.append(
+                UpBlock(in_ch, skip_ch, out_ch, time_dim, cond_dim, use_attn, context_dim)
+            )
+            in_ch = out_ch
+
+        self.final_res = ResidualBlock(in_ch, base_channels, time_dim, cond_dim)   
+
+        """
         self.out_conv = nn.Sequential(
             nn.GroupNorm(min(8, in_ch), in_ch),
             nn.SiLU(),
             nn.Conv2d(in_ch, in_channels, 3, padding=1),
+        )
+        """
+        # chnaged by Nani - changed the output conv to have a fixed in_ch
+        self.out_conv = nn.Sequential(
+            nn.GroupNorm(min(8, base_channels), base_channels),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, in_channels, 3, padding=1),
         )
 
     def forward(
@@ -382,6 +403,9 @@ class UNet(nn.Module):
             skip = skips.pop()
             x = block(x, skip, t_emb, cond, text_ctx)
 
+        # return self.out_conv(x)
+        # changed by Nani
+        x = self.final_res(x, t_emb, cond)
         return self.out_conv(x)
 
 

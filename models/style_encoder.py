@@ -123,7 +123,10 @@ class AdaptiveInstanceNorm(nn.Module):
         gamma, beta = params.chunk(2, dim=-1)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
-        return gamma * self.norm(x) + beta
+
+        # changed by Nani - applying normalization because the style vector is not guaranteed to have zero mean and unit variance
+        return (1 + gamma) * self.norm(x) + beta
+        # return gamma * self.norm(x) + beta
 
 
 class StyleConditionedBlock(nn.Module):

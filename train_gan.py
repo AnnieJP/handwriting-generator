@@ -11,6 +11,7 @@ import os
 import random
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -25,7 +26,16 @@ from utils.dataset import (
     collate_fn, encode_text, NUM_CLASSES
 )
 from utils.losses import GANTotalLoss, HingeLoss, CTCRecognitionLoss
+from utils.test_log import append_test_log
 import torch.nn.functional as F
+
+# changed by Nani - added device selection
+def get_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return "mps"
+    return "cpu"
 
 
 def parse_args():
@@ -47,10 +57,82 @@ def parse_args():
     p.add_argument("--lambda_ctc",  type=float, default=0.5,  help="CTC recogniser weight")
     p.add_argument("--n_critic",    type=int, default=1,      help="D steps per G step")
     p.add_argument("--save_every",  type=int, default=10)
-    p.add_argument("--device",      type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", type=str, default=get_device())
+    # changed by Nani - removed device arg since we auto-detect it now
+    # p.add_argument("--device",      type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed",        type=int, default=42)
+    p.add_argument("--smoke_test",  action="store_true",
+                   help="Run a short pipeline-verification cycle and print a pass/fail report")
+    p.add_argument("--smoke_epochs", type=int, default=5)
+    p.add_argument("--resume_from", type=str, default=None,
+                   help="Path to checkpoint to resume from, or 'auto' to use the latest in --output_dir.")
     return p.parse_args()
+
+
+def resolve_resume_path(spec: Optional[str], out_dir: Path) -> Optional[Path]:
+    """'auto' → latest epoch_*.pth in out_dir; literal path → that file."""
+    if not spec:
+        return None
+    if spec == "auto":
+        candidates = sorted(out_dir.glob("epoch_*.pth"))
+        return candidates[-1] if candidates else None
+    p = Path(spec)
+    return p if p.exists() else None
+
+
+def apply_smoke_overrides(args):
+    """Force fast settings for a pipeline sanity check.
+
+    Note: CTC is skipped (lambda_ctc=0) because torch.ctc_loss falls back to CPU
+    on MPS, dominating wall time. Smoke test verifies pipeline wiring, not
+    legibility — full training runs should re-enable CTC.
+    """
+    args.epochs = args.smoke_epochs
+    args.batch_size = 4
+    args.num_workers = 2
+    args.save_every = 1
+    args.lambda_ctc = 0.0
+    if args.output_dir == "checkpoints/gan":
+        args.output_dir = "checkpoints/gan_smoke"
+    print(f"[smoke_test] epochs={args.epochs}, batch_size={args.batch_size}, "
+          f"lambda_ctc=0 (skipped — MPS CPU-fallback bottleneck), "
+          f"output_dir={args.output_dir}")
+    return args
+
+
+def print_smoke_report(epoch_g_losses, epoch_d_losses, output_dir, model_name="gan"):
+    """For GAN, use D-loss as primary verdict signal (cleaner than 3-component G-loss)."""
+    if len(epoch_d_losses) < 2:
+        print(f"\n=== {model_name} smoke test: SKIPPED (need >= 2 epochs) ===")
+        return
+
+    g_start, g_end = epoch_g_losses[0], epoch_g_losses[-1]
+    d_start, d_end = epoch_d_losses[0], epoch_d_losses[-1]
+    g_ratio = g_end / g_start if g_start else float("inf")
+    d_ratio = d_end / d_start if d_start else float("inf")
+
+    if d_ratio < 0.7:
+        verdict = "PASS — D-loss decreasing healthily; pipeline is wired correctly"
+    elif d_ratio < 1.0:
+        verdict = "MARGINAL — D-loss decreasing slowly; try more epochs"
+    else:
+        verdict = "FAIL — D-loss not decreasing; check LR, data, model dims, device"
+
+    samples = sorted(Path(output_dir).glob("epoch*_sample*.png"))
+    bar = "=" * 60
+    n = len(epoch_d_losses)
+    print(f"\n{bar}\n  {model_name.upper()} SMOKE TEST REPORT\n{bar}")
+    print(f"  Epochs run     : {n}")
+    print(f"  D-loss epoch 1 : {d_start:.4f}   |  G-loss epoch 1 : {g_start:.4f}")
+    print(f"  D-loss epoch {n:<2}: {d_end:.4f}   |  G-loss epoch {n:<2}: {g_end:.4f}")
+    print(f"  D ratio        : {d_ratio:.3f}  (pass < 0.70, primary signal)")
+    print(f"  G ratio        : {g_ratio:.3f}  (informational; GAN G-loss is noisy in short runs)")
+    print(f"  Verdict        : {verdict}")
+    if samples:
+        print(f"  Sample images  : {len(samples)} files in {output_dir}/")
+        print(f"                   compare {samples[0].name} vs {samples[-1].name}")
+    print(bar + "\n")
 
 
 def build_datasets(args):
@@ -87,6 +169,7 @@ def train_one_epoch(
     model.train()
     device = args.device
     step = epoch * len(loader)
+    g_losses, d_losses = [], []
 
     for batch_idx, (imgs, labels, label_lengths) in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
         B = imgs.shape[0]
@@ -119,9 +202,12 @@ def train_one_epoch(
 
             d_loss = hinge.discriminator_loss(real_adv, fake_adv)
 
-            input_lengths = torch.full((B,), real_ocr.shape[0], dtype=torch.long)
-            ctc = ctc_loss(real_ocr, labels.to(device), input_lengths, label_lengths.to(device))
-            d_total = d_loss + args.lambda_ctc * ctc
+            if args.lambda_ctc > 0:
+                input_lengths = torch.full((B,), real_ocr.shape[0], dtype=torch.long)
+                ctc = ctc_loss(real_ocr, labels.to(device), input_lengths, label_lengths.to(device))
+                d_total = d_loss + args.lambda_ctc * ctc
+            else:
+                d_total = d_loss
 
             opt_d.zero_grad()
             d_total.backward()
@@ -138,13 +224,18 @@ def train_one_epoch(
         g_total.backward()
         opt_g.step()
 
+        g_losses.append(g_total.item())
+        d_losses.append(d_total.item())
+
         if batch_idx % 50 == 0:
             writer.add_scalar("Loss/G_total", g_total.item(), step + batch_idx)
             writer.add_scalar("Loss/D_total", d_total.item(), step + batch_idx)
             for k, v in g_components.items():
                 writer.add_scalar(f"Loss/G_{k}", v, step + batch_idx)
 
-    return g_total.item(), d_total.item()
+    avg_g = sum(g_losses) / max(1, len(g_losses))
+    avg_d = sum(d_losses) / max(1, len(d_losses))
+    return avg_g, avg_d
 
 
 def _pad_to_same(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -182,6 +273,8 @@ def validate(model, val_loader, style_refs, args, epoch, writer):
 
 def main():
     args = parse_args()
+    if args.smoke_test:
+        args = apply_smoke_overrides(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -198,7 +291,9 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
+        # changed by Nani - set pin_memory based on device
+        pin_memory = (args.device == "cuda"),
+        # pin_memory=True,
         drop_last=True,
     )
 
@@ -227,30 +322,78 @@ def main():
         print("WARNING: No user samples provided. Using random style references.")
 
     best_g_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    epoch_g_losses = []
+    epoch_d_losses = []
+    start_epoch = 1
+
+    resume_path = resolve_resume_path(args.resume_from, out_dir)
+    if resume_path is not None:
+        print(f"[resume] Loading checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=args.device)
+        model.load_state_dict(ckpt["model"])
+        opt_g.load_state_dict(ckpt["opt_g"])
+        opt_d.load_state_dict(ckpt["opt_d"])
+        start_epoch = ckpt["epoch"] + 1
+        best_g_loss = ckpt.get("best_g_loss", float("inf"))
+        print(f"[resume] Continuing from epoch {start_epoch} (best_g_loss={best_g_loss:.4f})")
+    elif args.resume_from:
+        print(f"[resume] No checkpoint found for '{args.resume_from}'; starting fresh.")
+
+    train_start = time.time()
+    for epoch in range(start_epoch, args.epochs + 1):
         g_loss, d_loss = train_one_epoch(
             model, opt_g, opt_d, train_loader, style_refs,
             g_loss_fn, hinge, ctc_loss, args, epoch, writer
         )
         print(f"Epoch {epoch:4d} | G: {g_loss:.4f} | D: {d_loss:.4f}")
+        epoch_g_losses.append(g_loss)
+        epoch_d_losses.append(d_loss)
 
         if epoch % args.save_every == 0 or epoch == args.epochs:
             validate(model, None, style_refs, args, epoch, writer)
+            if g_loss < best_g_loss:
+                best_g_loss = g_loss
             ckpt = {
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "opt_g": opt_g.state_dict(),
                 "opt_d": opt_d.state_dict(),
                 "g_loss": g_loss,
+                "best_g_loss": best_g_loss,
             }
             torch.save(ckpt, out_dir / f"epoch_{epoch:04d}.pth")
-            if g_loss < best_g_loss:
-                best_g_loss = g_loss
+            torch.save(ckpt, out_dir / "latest.pth")
+            if g_loss == best_g_loss:
                 torch.save(ckpt, out_dir / "best.pth")
                 print(f"  → Saved best checkpoint (G loss: {best_g_loss:.4f})")
 
     writer.close()
     print("Training complete.")
+
+    if args.smoke_test:
+        print_smoke_report(epoch_g_losses, epoch_d_losses, out_dir, model_name="gan")
+        append_test_log(
+            model_name="gan",
+            config={
+                "data_root": args.data_root,
+                "samples_dir": args.samples_dir,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr_g": args.lr_g,
+                "lr_d": args.lr_d,
+                "lambda1": args.lambda1,
+                "lambda2": args.lambda2,
+                "lambda3": args.lambda3,
+                "lambda_ctc": args.lambda_ctc,
+                "n_critic": args.n_critic,
+                "device": args.device,
+            },
+            epoch_losses=epoch_d_losses,
+            aux_losses={"G-loss": epoch_g_losses},
+            wall_time_seconds=time.time() - train_start,
+            output_dir=out_dir,
+            notes="Primary verdict signal is D-loss (cleaner than 3-component G-loss for GAN smoke).",
+        )
 
 
 if __name__ == "__main__":

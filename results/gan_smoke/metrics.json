@@ -1,0 +1,10 @@
+{
+  "model": "gan",
+  "checkpoint": "checkpoints/gan_smoke/best.pth",
+  "split": "test",
+  "n_samples": 20,
+  "FID": 279.7113,
+  "CER": 1.2603,
+  "WER": 1.0,
+  "SSIM": 0.0526
+}

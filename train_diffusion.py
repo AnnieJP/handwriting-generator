@@ -8,7 +8,9 @@ Usage:
 
 import argparse
 import random
+import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.optim as optim
@@ -22,6 +24,15 @@ from utils.dataset import (
     collate_fn, encode_text
 )
 from utils.losses import DiffusionTotalLoss
+from utils.test_log import append_test_log
+
+# changed by Nani - added device selection
+def get_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return "mps"
+    return "cpu"
 
 
 def parse_args():
@@ -43,10 +54,72 @@ def parse_args():
     p.add_argument("--lambda_text",   type=float, default=0.5)
     p.add_argument("--save_every",    type=int, default=10)
     p.add_argument("--sample_every",  type=int, default=5)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", type=str, default=get_device())
+    # changed by Nani - removed device arg since we auto-detect it now
+    # p.add_argument("--device",      type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--num_workers",   type=int, default=4)
     p.add_argument("--seed",          type=int, default=42)
+    p.add_argument("--resume_from",   type=str, default=None,
+                   help="Path to checkpoint to resume from, or 'auto' to use the latest in --output_dir.")
+    p.add_argument("--smoke_test",    action="store_true",
+                   help="Run a short pipeline-verification cycle and print a pass/fail report")
+    p.add_argument("--smoke_epochs",  type=int, default=5)
     return p.parse_args()
+
+
+def apply_smoke_overrides(args):
+    """Force fast settings for a pipeline sanity check."""
+    args.epochs = args.smoke_epochs
+    args.batch_size = 4
+    args.timesteps = 250
+    args.num_workers = 2
+    args.sample_every = 1
+    args.save_every = args.smoke_epochs
+    if args.output_dir == "checkpoints/diffusion":
+        args.output_dir = "checkpoints/diffusion_smoke"
+    print(f"[smoke_test] epochs={args.epochs}, batch_size={args.batch_size}, "
+          f"timesteps={args.timesteps}, output_dir={args.output_dir}")
+    return args
+
+
+def print_smoke_report(epoch_losses, output_dir, model_name):
+    if len(epoch_losses) < 2:
+        print(f"\n=== {model_name} smoke test: SKIPPED (need >= 2 epochs) ===")
+        return
+
+    start, end = epoch_losses[0], epoch_losses[-1]
+    ratio = end / start if start > 0 else float("inf")
+
+    if ratio < 0.7:
+        verdict = "PASS — loss decreasing healthily; pipeline is wired correctly"
+    elif ratio < 1.0:
+        verdict = "MARGINAL — loss decreasing slowly; try more epochs or tune LR"
+    else:
+        verdict = "FAIL — loss not decreasing; check LR, data, model dims, device"
+
+    samples = sorted(Path(output_dir).glob("epoch*_sample*.png"))
+    bar = "=" * 60
+    print(f"\n{bar}\n  {model_name.upper()} SMOKE TEST REPORT\n{bar}")
+    print(f"  Epochs run     : {len(epoch_losses)}")
+    print(f"  Loss epoch 1   : {start:.4f}")
+    print(f"  Loss epoch {len(epoch_losses):<3}: {end:.4f}")
+    print(f"  Ratio end/start: {ratio:.3f}  (pass < 0.70)")
+    print(f"  Verdict        : {verdict}")
+    if samples:
+        print(f"  Sample images  : {len(samples)} files in {output_dir}/")
+        print(f"                   compare {samples[0].name} vs {samples[-1].name}")
+    print(bar + "\n")
+
+
+def resolve_resume_path(spec: Optional[str], out_dir: Path) -> Optional[Path]:
+    """'auto' → latest epoch_*.pth in out_dir; literal path → that file."""
+    if not spec:
+        return None
+    if spec == "auto":
+        candidates = sorted(out_dir.glob("epoch_*.pth"))
+        return candidates[-1] if candidates else None
+    p = Path(spec)
+    return p if p.exists() else None
 
 
 def build_datasets(args):
@@ -150,6 +223,8 @@ def sample_and_log(model, style_refs, args, epoch, writer, out_dir):
 
 def main():
     args = parse_args()
+    if args.smoke_test:
+        args = apply_smoke_overrides(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -165,7 +240,9 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
+        # changed by Nani - set pin_memory based on device
+        pin_memory = (args.device == "cuda"),
+        # pin_memory=True,
         drop_last=True,
     )
 
@@ -194,7 +271,25 @@ def main():
         print("WARNING: No user samples provided. Using random style references.")
 
     best_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    epoch_losses = []
+    start_epoch = 1
+
+    resume_path = resolve_resume_path(args.resume_from, out_dir)
+    if resume_path is not None:
+        print(f"[resume] Loading checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=args.device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_loss = ckpt.get("best_loss", float("inf"))
+        print(f"[resume] Continuing from epoch {start_epoch} (best_loss={best_loss:.4f})")
+    elif args.resume_from:
+        print(f"[resume] No checkpoint found for '{args.resume_from}'; starting fresh.")
+
+    train_start = time.time()
+    for epoch in range(start_epoch, args.epochs + 1):
         avg_loss = train_one_epoch(
             model, optimizer, loss_fn,
             train_loader, style_refs,
@@ -203,27 +298,50 @@ def main():
         scheduler.step()
         print(f"Epoch {epoch:4d} | Avg Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
         writer.add_scalar("Train/avg_loss", avg_loss, epoch)
+        epoch_losses.append(avg_loss)
 
         if epoch % args.sample_every == 0:
             sample_and_log(model, style_refs, args, epoch, writer, out_dir)
 
         if epoch % args.save_every == 0 or epoch == args.epochs:
+            if avg_loss < best_loss:
+                best_loss = avg_loss
             ckpt = {
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "loss": avg_loss,
+                "best_loss": best_loss,
                 "args": vars(args),
             }
             torch.save(ckpt, out_dir / f"epoch_{epoch:04d}.pth")
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            torch.save(ckpt, out_dir / "latest.pth")
+            if avg_loss == best_loss:
                 torch.save(ckpt, out_dir / "best.pth")
                 print(f"  → Saved best checkpoint (loss: {best_loss:.4f})")
 
     writer.close()
     print("Training complete.")
+
+    if args.smoke_test:
+        print_smoke_report(epoch_losses, out_dir, model_name="diffusion")
+        append_test_log(
+            model_name="diffusion",
+            config={
+                "data_root": args.data_root,
+                "samples_dir": args.samples_dir,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "timesteps": args.timesteps,
+                "schedule": args.schedule,
+                "lr": args.lr,
+                "device": args.device,
+            },
+            epoch_losses=epoch_losses,
+            wall_time_seconds=time.time() - train_start,
+            output_dir=out_dir,
+        )
 
 
 if __name__ == "__main__":
